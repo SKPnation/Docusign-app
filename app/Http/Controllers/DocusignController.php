@@ -7,6 +7,14 @@ use Illuminate\Http\Request;
 use DocuSign\eSign\Configuration;
 use DocuSign\eSign\Api\EnvelopesApi;
 use DocuSign\eSign\Client\ApiClient;
+use DocuSign\eSign\Model\Document;
+use DocuSign\eSign\Model\EnvelopeDefinition;
+use DocuSign\eSign\Model\Recipients;
+use DocuSign\eSign\Model\RecipientViewRequest;
+use DocuSign\eSign\Model\Signer;
+use DocuSign\eSign\Model\SignHere;
+use DocuSign\eSign\Model\Text;
+use DocuSign\eSign\Model\Tabs;
 use Illuminate\Support\Facades\Http;
 use Exception;
 use Session;
@@ -83,7 +91,18 @@ class DocusignController extends Controller
             ]);
         }
 
-        $request->session()->put('docusign_access_token', $result['access_token']);
+        $accessToken = $result['access_token'];
+
+        $userInfo = Http::withToken($accessToken)
+            ->get('https://account-d.docusign.com/oauth/userinfo')
+            ->json();
+
+        $defaultAccount = collect($userInfo['accounts'])->firstWhere('is_default', true)
+            ?? $userInfo['accounts'][0];
+
+        $request->session()->put('docusign_access_token', $accessToken);
+        $request->session()->put('docusign_account_id', $defaultAccount['account_id']); // ✅ correct
+        $request->session()->put('docusign_base_path', $defaultAccount['base_uri'] . '/restapi'); // ✅ correct
 
         return redirect()->route('docusign')->with('success', 'Docusign Successfully Connected');
     }
@@ -95,6 +114,10 @@ class DocusignController extends Controller
      */
     public function signDocument()
     {
+        if (!Session::has('docusign_access_token')) {
+            return redirect()->route('connect.docusign')->with('error', 'Connect DocuSign first.');
+        }
+
         try {
             $this->args = $this->getTemplateArgs();
             $args = $this->args;
@@ -103,20 +126,24 @@ class DocusignController extends Controller
             /* Create the envelope request object */
             $envelope_definition = $this->makeEnvelopeFileObject($args["envelope_args"]);
             $envelope_api = $this->getEnvelopeApi();
-            $api_client = new \DocuSign\eSign\client\ApiClient($this->config);
-            $envelope_api = new \DocuSign\eSign\Api\EnvelopesApi($api_client);
+            $api_client = new ApiClient($this->config);
+            $envelope_api = new EnvelopesApi($api_client);
             $results = $envelope_api->createEnvelope($args['account_id'], $envelope_definition);
             $envelopeId = $results->getEnvelopeId();
             $authentication_method = 'None';
-            $recipient_view_request = new \DocuSign\eSign\Model\RecipientViewRequest([
+            $recipient_view_request = new RecipientViewRequest([
                 'authentication_method' => $authentication_method,
                 'client_user_id' => $envelope_args['signer_client_id'],
                 'recipient_id' => '1',
                 'return_url' => $envelope_args['ds_return_url'],
-                'user_name' => 'savani', 'email' => 'savani@gmail.com'
+                'user_name' => 'Ayomide Ajayi', 'email' => 'ayomideseaz@gmail.com'
             ]);
 
-            $results = $envelope_api->createRecipientView($args['account_id'], $envelopeId, $recipient_view_request);
+            $results = $envelope_api->createRecipientView(
+                $args['account_id'],
+                $envelopeId,
+                $recipient_view_request
+            );
 
             return redirect()->to($results['url']);
         } catch (Exception $e) {
@@ -125,11 +152,6 @@ class DocusignController extends Controller
         }
     }
 
-    /**
-     * Write code on Method
-     *
-     * @return response()
-     */
     private function makeEnvelopeFileObject($args)
     {
         $docsFilePath = public_path('doc/demo_pdf_new.pdf');
@@ -142,44 +164,67 @@ class DocusignController extends Controller
         $contentBytes = file_get_contents($docsFilePath, false, stream_context_create($arrContextOptions));
 
         /* Create the document model */
-        $document = new \DocuSign\eSign\Model\Document([
+        $document = new Document([
             'document_base64' => base64_encode($contentBytes),
-            'name' => 'Example Document File',
+            'name' => 'The Tranquil Life Therapist Onboarding Agreement',
             'file_extension' => 'pdf',
             'document_id' => 1
         ]);
 
+        //Pull signer details from backend (pass these in $args)
+        $signerEmail = $args['signer_email'];
+        $signerName  = $args['signer_name'];
+
         /* Create the signer recipient model */
-        $signer = new \DocuSign\eSign\Model\Signer([
-            'email' => 'savani@gmail.com',
-            'name' => 'savani',
+        $signer = new Signer([
+            'email' => $signerEmail,
+            'name' => $signerName,
             'recipient_id' => '1',
             'routing_order' => '1',
             'client_user_id' => $args['signer_client_id']
         ]);
 
-        /* Create a signHere tab (field on the document) */
-        $signHere = new \DocuSign\eSign\Model\SignHere([
-            'anchor_string' => '/sn1/',
+        // REQUIRED NAME FIELD
+        $fullName = new \DocuSign\eSign\Model\Text([
+            'anchor_string' => '[[TL_FULL_NAME]]',
             'anchor_units' => 'pixels',
+            'anchor_x_offset' => '0',
+            'anchor_y_offset' => '-5',
+            'required' => 'true',
+            'tab_label' => 'Full Name',
+        ]);
+
+        // REQUIRED ADDRESS FIELD
+        $address = new \DocuSign\eSign\Model\Text([
+            'anchor_string' => '[[TL_ADDRESS]]',
+            'anchor_units' => 'pixels',
+            'anchor_x_offset' => '0',
+            'anchor_y_offset' => '-5',
+            'required' => 'true',
+            'tab_label' => 'Address',
+        ]);
+
+        /* 
+        - Create a signHere tab (field on the document)
+        - Auto-place signature at the last page marker 
+        */
+        $signHere = new SignHere([
+            'anchor_string' => '[[TL_SIGN_HERE]]', // <-- put this in PDF on last page
+            'anchor_units' => 'pixels',
+            'anchor_x_offset' => '20',
             'anchor_y_offset' => '10',
-            'anchor_x_offset' => '20'
+            'required' => 'true',
         ]);
 
-        /* Create a signHere 2 tab (field on the document) */
-        $signHere2 = new \DocuSign\eSign\Model\SignHere([
-            'anchor_string' => '/sn2/',
-            'anchor_units' => 'pixels',
-            'anchor_y_offset' => '40',
-            'anchor_x_offset' => '40'
-        ]);
+        $signer->setTabs(new Tabs([
+            'sign_here_tabs' => [$signHere],
+            'text_tabs' => [$fullName, $address]
+        ]));
 
-        $signer->settabs(new \DocuSign\eSign\Model\Tabs(['sign_here_tabs' => [$signHere, $signHere2]]));
-
-        $envelopeDefinition = new \DocuSign\eSign\Model\EnvelopeDefinition([
-            'email_subject' => "Please sign this document sent from the ItSlutionStuff.com",
+        $envelopeDefinition = new EnvelopeDefinition([
+            'email_subject' => "Tranquil Life Therapist Onboarding Agreement",
             'documents' => [$document],
-            'recipients' => new \DocuSign\eSign\Model\Recipients(['signers' => [$signer]]),
+            'recipients' => new Recipients(['signers' => [$signer]]),
             'status' => "sent",
         ]);
 
@@ -209,12 +254,18 @@ class DocusignController extends Controller
     private function getTemplateArgs()
     {
         $args = [
-            'account_id' => env('DOCUSIGN_ACCOUNT_ID'),
-            'base_path' => env('DOCUSIGN_BASE_URL'),
-            'ds_access_token' => Session::get('docusign_auth_code'),
+            'account_id' => Session::get('docusign_account_id'),
+            'base_path' => Session::get('docusign_base_path'),
+            'ds_access_token' => Session::get('docusign_access_token'),
+
+            // 'account_id' => env('DOCUSIGN_ACCOUNT_ID'),
+            // 'base_path' => env('DOCUSIGN_BASE_URL'),
+            // 'ds_access_token' => Session::get('docusign_auth_code'),
             'envelope_args' => [
                 'signer_client_id' => $this->signer_client_id,
-                'ds_return_url' => route('docusign')
+                'signer_name' => 'Ayomide Ajayi',
+                'signer_email' => 'ayomideseaz@gmail.com',
+                'ds_return_url' => route('docusign'),
             ]
         ];
 
